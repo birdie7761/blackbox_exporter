@@ -1,6 +1,7 @@
 package main
 
 import (
+	"github.com/go-kit/kit/log"
 	"fmt"
 	"time"
 
@@ -15,8 +16,7 @@ type exporterService struct{}
 
 func (m *exporterService) Execute(args []string, r <-chan svc.ChangeRequest, changes chan<- svc.Status) (ssec bool, errno uint32) {
 	const cmdsAccepted = svc.AcceptStop | svc.AcceptShutdown | svc.AcceptPauseAndContinue
-	changes <- svc.Status{State: svc.StartPending}
-	go blackBoxService()
+	changes <- svc.Status{State: svc.StartPending}	
 	changes <- svc.Status{State: svc.Running, Accepts: cmdsAccepted}
 loop:
 	for c := range r {
@@ -36,7 +36,7 @@ loop:
 	return
 }
 
-func runService(name string, isDebug bool) {
+func runService(name string,logger log.Logger, isDebug bool) {
 	var err error
 	if isDebug {
 		elog = debug.New(name)
@@ -49,6 +49,7 @@ func runService(name string, isDebug bool) {
 	defer elog.Close()
 
 	elog.Info(1, fmt.Sprintf("starting %s service", name))
+	go blackBoxService(logger)
 	run := svc.Run
 	if isDebug {
 		run = debug.Run

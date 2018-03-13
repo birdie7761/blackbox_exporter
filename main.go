@@ -203,13 +203,8 @@ func init() {
 	prometheus.MustRegister(version.NewCollector("blackbox_exporter"))
 }
 
-func blackBoxService() {
-	allowedLevel := promlog.AllowedLevel{}
-	flag.AddFlags(kingpin.CommandLine, &allowedLevel)
-	kingpin.Version(version.Print("blackbox_exporter"))
-	kingpin.HelpFlag.Short('h')
-	kingpin.Parse()
-	logger := promlog.New(allowedLevel)
+func blackBoxService(logger log.Logger) {
+
 	rh := &resultHistory{}
 
 	level.Info(logger).Log("msg", "Starting blackbox_exporter", "version", version.Info())
@@ -331,14 +326,21 @@ func blackBoxService() {
 }
 
 func main() {
+	allowedLevel := promlog.AllowedLevel{}
+	flag.AddFlags(kingpin.CommandLine, &allowedLevel)
+	kingpin.Version(version.Print("blackbox_exporter"))
+	kingpin.HelpFlag.Short('h')
+	kingpin.Parse()
+	logger := promlog.New(allowedLevel)
+
 	isIntSess, err := svc.IsAnInteractiveSession()
 	if err != nil {
-		//level.Error(logger).Log("failed to determine if we are running in an interactive session: %v", err)
+		level.Error(logger).Log("failed to determine if we are running in an interactive session: %v", err)
 	}
 	if !isIntSess {
-		runService(os.Args[0], false)
+		runService(os.Args[0],logger , false)
 		return
 	}
 
-	blackBoxService()
+	blackBoxService(logger)
 }
