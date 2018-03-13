@@ -85,18 +85,28 @@ func ProbeICMP(ctx context.Context, target string, module config.Module, registr
 		requestType = ipv4.ICMPTypeEcho
 		replyType = ipv4.ICMPTypeEchoReply
 
-		s, err := net.ListenPacket("ip4:icmp", "0.0.0.0")
-		if err != nil {
-			level.Error(logger).Log("msg", "Error listening to socket", "err", err)
-			return
-		}
+		if !module.ICMP.DontFragment {
+			socket, err = icmp.ListenPacket("ip4:icmp", "0.0.0.0")
+			if err != nil {
+				level.Error(logger).Log("msg", "Error listening to socket", "err", err)
+				return
+			}
+		} else {
+			// BUG(mikio): On Windows, the ReadFrom and WriteTo methods of RawConn
+			// are not implemented.
+			s, err := net.ListenPacket("ip4:icmp", "0.0.0.0")
+			if err != nil {
+				level.Error(logger).Log("msg", "Error listening to socket", "err", err)
+				return
+			}
 
-		rc, err := ipv4.NewRawConn(s)
-		if err != nil {
-			level.Error(logger).Log("msg", "Error creating raw connection", "err", err)
-			return
+			rc, err := ipv4.NewRawConn(s)
+			if err != nil {
+				level.Error(logger).Log("msg", "cannot construct raw connection", "err", err)
+				return
+			}
+			socket = &v4Conn{c: rc, df: module.ICMP.DontFragment, src: srcIP}
 		}
-		socket = &v4Conn{c: rc, df: module.ICMP.DontFragment, src: srcIP}
 	}
 
 	defer socket.Close()
