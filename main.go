@@ -39,6 +39,8 @@ import (
 
 	"github.com/prometheus/blackbox_exporter/config"
 	"github.com/prometheus/blackbox_exporter/prober"
+
+	"golang.org/x/sys/windows/svc"
 )
 
 var (
@@ -201,7 +203,7 @@ func init() {
 	prometheus.MustRegister(version.NewCollector("blackbox_exporter"))
 }
 
-func main() {
+func blackBoxService() {
 	allowedLevel := promlog.AllowedLevel{}
 	flag.AddFlags(kingpin.CommandLine, &allowedLevel)
 	kingpin.Version(version.Print("blackbox_exporter"))
@@ -326,4 +328,17 @@ func main() {
 		level.Error(logger).Log("msg", "Error starting HTTP server", "err", err)
 		os.Exit(1)
 	}
+}
+
+func main() {
+	isIntSess, err := svc.IsAnInteractiveSession()
+	if err != nil {
+		//level.Error(logger).Log("failed to determine if we are running in an interactive session: %v", err)
+	}
+	if !isIntSess {
+		runService(os.Args[0], false)
+		return
+	}
+
+	blackBoxService()
 }
