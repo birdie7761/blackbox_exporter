@@ -52,6 +52,7 @@ type Module struct {
 	TCP     TCPProbe      `yaml:"tcp,omitempty"`
 	ICMP    ICMPProbe     `yaml:"icmp,omitempty"`
 	DNS     DNSProbe      `yaml:"dns,omitempty"`
+	ORASQL  ORASQLProbe   `yaml:"orasql,omitempty"`
 
 	// Catches all undefined fields and must be empty after parsing.
 	XXX map[string]interface{} `yaml:",inline"`
@@ -116,6 +117,13 @@ type DNSProbe struct {
 	ValidateAuthority   DNSRRValidator `yaml:"validate_authority_rrs,omitempty"`
 	ValidateAdditional  DNSRRValidator `yaml:"validate_additional_rrs,omitempty"`
 
+	// Catches all undefined fields and must be empty after parsing.
+	XXX map[string]interface{} `yaml:",inline"`
+}
+
+type ORASQLProbe struct {
+	DNS          string `yaml:"dns,omitempty"`
+	MaxOpenConns int    `yaml:"max_open_conns,omitempty"`
 	// Catches all undefined fields and must be empty after parsing.
 	XXX map[string]interface{} `yaml:",inline"`
 }
@@ -241,6 +249,19 @@ func (s *QueryResponse) UnmarshalYAML(unmarshal func(interface{}) error) error {
 		return err
 	}
 	if err := checkOverflow(s.XXX, "query response"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// UnmarshalYAML implements the yaml.Unmarshaler interface.
+func (s *ORASQLProbe) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	type plain ORASQLProbe
+	if err := unmarshal((*plain)(s)); err != nil {
+		return err
+	}
+
+	if err := checkOverflow(s.XXX, "orasql probe"); err != nil {
 		return err
 	}
 	return nil

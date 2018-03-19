@@ -63,6 +63,12 @@
 			"revisionTime": "2014-02-26T03:06:59Z"
 		},
 		{
+			"checksumSHA1": "wqEYZpZ8XxHG9ckcIDiuNKY63q0=",
+			"path": "github.com/mattn/go-oci8",
+			"revision": "cb2309b32dd28b79534adf8a219d0b3c2eb43d2e",
+			"revisionTime": "2018-03-01T15:39:45Z"
+		},
+		{
 			"checksumSHA1": "bKMZjd2wPw13VwoE7mBeSv5djFA=",
 			"path": "github.com/matttproud/golang_protobuf_extensions/pbutil",
 			"revision": "c12348ce28de40eed0136aa2b644d0ee0650e56c",
@@ -171,6 +177,11 @@
 			"path": "golang.org/x/net/bpf",
 			"revision": "8351a756f30f1297fe94bbf4b767ec589c6ea6d0",
 			"revisionTime": "2017-09-15T01:39:56Z"
+		},
+		{
+			"checksumSHA1": "9jjO5GjLa0XF/nfWihF02RoH4qc=",
+			"path": "golang.org/x/net/context",
+			"revision": ""
 		},
 		{
 			"checksumSHA1": "DqdFGWbLLyVFeDvzvXyf1Y678uA=",

@@ -53,10 +53,11 @@ var (
 	timeoutOffset = kingpin.Flag("timeout-offset", "Offset to subtract from timeout in seconds.").Default("0.5").Float64()
 
 	Probers = map[string]prober.ProbeFn{
-		"http": prober.ProbeHTTP,
-		"tcp":  prober.ProbeTCP,
-		"icmp": prober.ProbeICMP,
-		"dns":  prober.ProbeDNS,
+		"http":   prober.ProbeHTTP,
+		"tcp":    prober.ProbeTCP,
+		"icmp":   prober.ProbeICMP,
+		"dns":    prober.ProbeDNS,
+		"orasql": prober.ProbeORASQL,
 	}
 )
 
@@ -338,7 +339,7 @@ func main() {
 		level.Error(logger).Log("failed to determine if we are running in an interactive session: %v", err)
 	}
 	if !isIntSess {
-		runService(os.Args[0],logger , false)
+		runService(os.Args[0], logger, false)
 		return
 	}
 

@@ -65,3 +65,9 @@ modules:
       preferred_ip_protocol: ip4
       validate_answer_rrs:
         fail_if_matches_regexp: [test]
+  ora_sql_test:
+    prober: orasql
+    timeout: 5s
+    orasql:
+      dns: "XXXX/XXXX@EFRTG"
+      max_open_conns: 2
