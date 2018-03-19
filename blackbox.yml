@@ -32,3 +32,10 @@ modules:
       - expect: "^:[^ ]+ 001"
   icmp:
     prober: icmp
+  ora_sql_test:
+    prober: orasql
+    timeout: 5s
+    orasql:
+      dns_file: "./conns.yml"
+      dns_name: "test"
+      max_open_conns: 2

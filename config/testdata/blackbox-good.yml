@@ -69,5 +69,6 @@ modules:
     prober: orasql
     timeout: 5s
     orasql:
-      dns: "XXXX/XXXX@EFRTG"
+      dns_file: "./conns.yml"
+      dns_name: "test"
       max_open_conns: 2

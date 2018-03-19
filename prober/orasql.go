@@ -16,12 +16,15 @@ package prober
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"io/ioutil"
 	"sync"
 	"time"
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/prometheus/client_golang/prometheus"
+	yaml "gopkg.in/yaml.v2"
 
 	"github.com/prometheus/blackbox_exporter/config"
 
@@ -32,6 +35,15 @@ var db *sql.DB
 var isInitDB bool
 var l sync.Mutex
 
+type DBConnConfig struct {
+	Conns map[string]string `yaml:"conns"`
+
+	// Catches all undefined fields and must be empty after parsing.
+	XXX map[string]interface{} `yaml:",inline"`
+}
+
+var dbc *DBConnConfig = &DBConnConfig{}
+
 func initSqlDB(module config.Module, logger log.Logger) {
 	if !isInitDB {
 		l.Lock()
@@ -39,9 +51,10 @@ func initSqlDB(module config.Module, logger log.Logger) {
 		if isInitDB {
 			return
 		}
+		dbc.loadDBConfig(module.ORASQL.DNSFile)
 		var err error
 		// os.Setenv("NLS_LANG", "AMERICAN_AMERICA.ZHS16GBK")
-		db, err = sql.Open("oci8", module.ORASQL.DNS)
+		db, err = sql.Open("oci8", dbc.Conns[module.ORASQL.DNSName])
 		db.SetMaxOpenConns(module.ORASQL.MaxOpenConns)
 		if err != nil {
 			level.Error(logger).Log("msg", "Error opening connection to database:", "err", err)
@@ -92,4 +105,27 @@ func ProbeORASQL(ctx context.Context, target string, module config.Module, regis
 		level.Info(logger).Log("msg", "key", f1, "value", f2)
 	}
 	return true
+}
+
+func (sc *DBConnConfig) loadDBConfig(confFile string) (err error) {
+
+	yamlFile, err := ioutil.ReadFile(confFile)
+	if err != nil {
+		return fmt.Errorf("Error reading config file: %s", err)
+	}
+
+	if err := yaml.Unmarshal(yamlFile, sc); err != nil {
+		return fmt.Errorf("Error parsing config file: %s", err)
+	}
+
+	return nil
+}
+
+func (sc *DBConnConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	type plain DBConnConfig
+	if err := unmarshal((*plain)(sc)); err != nil {
+		return err
+	}
+
+	return nil
 }

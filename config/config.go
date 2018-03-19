@@ -122,7 +122,8 @@ type DNSProbe struct {
 }
 
 type ORASQLProbe struct {
-	DNS          string `yaml:"dns,omitempty"`
+	DNSFile      string `yaml:"dns_file,omitempty"`
+	DNSName      string `yaml:"dns_name,omitempty"`
 	MaxOpenConns int    `yaml:"max_open_conns,omitempty"`
 	// Catches all undefined fields and must be empty after parsing.
 	XXX map[string]interface{} `yaml:",inline"`
