@@ -31,8 +31,7 @@ import (
 	_ "github.com/mattn/go-oci8"
 )
 
-var db *sql.DB
-var isInitDB bool
+var dbs = map[string]*sql.DB{}
 var l sync.Mutex
 
 type DBConnConfig struct {
@@ -44,25 +43,28 @@ type DBConnConfig struct {
 
 var dbc *DBConnConfig = &DBConnConfig{}
 
-func initSqlDB(module config.Module, logger log.Logger) {
-	if !isInitDB {
-		l.Lock()
-		defer l.Unlock()
-		if isInitDB {
-			return
-		}
-		dbc.loadDBConfig(module.ORASQL.DNSFile)
-		var err error
-		// os.Setenv("NLS_LANG", "AMERICAN_AMERICA.ZHS16GBK")
-		db, err = sql.Open("oci8", dbc.Conns[module.ORASQL.DNSName])
-		db.SetMaxOpenConns(module.ORASQL.MaxOpenConns)
-		if err != nil {
-			level.Error(logger).Log("msg", "Error opening connection to database:", "err", err)
-			return
-		}
-		db.SetConnMaxLifetime(time.Duration(1 * time.Hour))
-		isInitDB = true
+func getSqlDB(module config.Module, logger log.Logger) (conn *sql.DB) {
+	if _, ok := dbs[module.ORASQL.DNSName]; ok {
+		return dbs[module.ORASQL.DNSName]
 	}
+
+	l.Lock()
+	defer l.Unlock()
+	if _, ok := dbs[module.ORASQL.DNSName]; ok {
+		return dbs[module.ORASQL.DNSName]
+	}
+
+	dbc.loadDBConfig(module.ORASQL.DNSFile)
+	// os.Setenv("NLS_LANG", "AMERICAN_AMERICA.ZHS16GBK")
+	db, err := sql.Open("oci8", dbc.Conns[module.ORASQL.DNSName])
+	db.SetMaxOpenConns(module.ORASQL.MaxOpenConns)
+	if err != nil {
+		level.Error(logger).Log("msg", "Error opening connection to database:", "err", err)
+		return
+	}
+	db.SetConnMaxLifetime(time.Duration(1 * time.Hour))
+	dbs[module.ORASQL.DNSName] = db
+	return db
 }
 
 func ProbeORASQL(ctx context.Context, target string, module config.Module, registry *prometheus.Registry, logger log.Logger) (success bool) {
@@ -83,7 +85,7 @@ func ProbeORASQL(ctx context.Context, target string, module config.Module, regis
 		durationGauge.Set(time.Since(begun).Seconds())
 	}(time.Now())
 
-	initSqlDB(module, logger)
+	db := getSqlDB(module, logger)
 
 	registry.MustRegister(durationGauge)
 	registry.MustRegister(metricsGaugeVec)
@@ -102,7 +104,7 @@ func ProbeORASQL(ctx context.Context, target string, module config.Module, regis
 		var f2 float64
 		rows.Scan(&f1, &f2)
 		metricsGaugeVec.WithLabelValues(f1).Add(f2)
-		level.Info(logger).Log("msg", "key", f1, "value", f2)
+		level.Info(logger).Log("tag", f1, "value", f2)
 	}
 	return true
 }
