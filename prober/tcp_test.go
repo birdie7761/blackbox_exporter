@@ -51,7 +51,7 @@ func TestTCPConnection(t *testing.T) {
 	testCTX, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	registry := prometheus.NewRegistry()
-	if !ProbeTCP(testCTX, ln.Addr().String(), config.Module{}, registry, log.NewNopLogger()) {
+	if !ProbeTCP(testCTX, ln.Addr().String(), config.Module{TCP: config.TCPProbe{IPProtocolFallback: true}}, registry, log.NewNopLogger()) {
 		t.Fatalf("TCP module failed, expected success.")
 	}
 	<-ch
@@ -62,12 +62,16 @@ func TestTCPConnectionFails(t *testing.T) {
 	registry := prometheus.NewRegistry()
 	testCTX, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if ProbeTCP(testCTX, ":0", config.Module{}, registry, log.NewNopLogger()) {
+	if ProbeTCP(testCTX, ":0", config.Module{TCP: config.TCPProbe{}}, registry, log.NewNopLogger()) {
 		t.Fatalf("TCP module suceeded, expected failure.")
 	}
 }
 
 func TestTCPConnectionWithTLS(t *testing.T) {
+	if os.Getenv("TRAVIS") == "true" {
+		t.Skip("skipping; travisci is failing on ipv6 dns requests")
+	}
+
 	ln, err := net.Listen("tcp", ":0")
 	if err != nil {
 		t.Fatalf("Error listening on socket: %s", err)
@@ -114,6 +118,8 @@ func TestTCPConnectionWithTLS(t *testing.T) {
 		tlsConfig := &tls.Config{
 			ServerName:   "localhost",
 			Certificates: []tls.Certificate{testcert},
+			MinVersion:   tls.VersionTLS12,
+			MaxVersion:   tls.VersionTLS12,
 		}
 		tlsConn := tls.Server(conn, tlsConfig)
 		defer tlsConn.Close()
@@ -129,8 +135,9 @@ func TestTCPConnectionWithTLS(t *testing.T) {
 	// Expect name-verified TLS connection.
 	module := config.Module{
 		TCP: config.TCPProbe{
-			PreferredIPProtocol: "ipv4",
-			TLS:                 true,
+			IPProtocol:         "ip4",
+			IPProtocolFallback: true,
+			TLS:                true,
 			TLSConfig: pconfig.TLSConfig{
 				CAFile:             tmpCaFile.Name(),
 				InsecureSkipVerify: false,
@@ -164,13 +171,24 @@ func TestTCPConnectionWithTLS(t *testing.T) {
 	}
 	<-ch
 
-	// Check the probe_ssl_earliest_cert_expiry.
+	// Check the resulting metrics.
 	mfs, err := registry.Gather()
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	// Check labels
+	expectedLabels := map[string]map[string]string{
+		"probe_tls_version_info": {
+			"version": "TLS 1.2",
+		},
+	}
+	checkRegistryLabels(expectedLabels, mfs, t)
+
+	// Check values
 	expectedResults := map[string]float64{
 		"probe_ssl_earliest_cert_expiry": float64(certExpiry.Unix()),
+		"probe_tls_version_info":         1,
 	}
 	checkRegistryResults(expectedResults, mfs, t)
 }
@@ -205,6 +223,7 @@ func TestTCPConnectionQueryResponseStartTLS(t *testing.T) {
 	// Define some (bogus) example SMTP dialog with STARTTLS.
 	module := config.Module{
 		TCP: config.TCPProbe{
+			IPProtocolFallback: true,
 			QueryResponse: []config.QueryResponse{
 				{Expect: "^220.*ESMTP.*$"},
 				{Send: "EHLO tls.prober"},
@@ -299,6 +318,7 @@ func TestTCPConnectionQueryResponseIRC(t *testing.T) {
 
 	module := config.Module{
 		TCP: config.TCPProbe{
+			IPProtocolFallback: true,
 			QueryResponse: []config.QueryResponse{
 				{Send: "NICK prober"},
 				{Send: "USER prober prober prober :prober"},
@@ -367,6 +387,7 @@ func TestTCPConnectionQueryResponseMatching(t *testing.T) {
 	time.Sleep(time.Millisecond * 100)
 	module := config.Module{
 		TCP: config.TCPProbe{
+			IPProtocolFallback: true,
 			QueryResponse: []config.QueryResponse{
 				{
 					Expect: "SSH-2.0-(OpenSSH_6.9p1) Debian-2",
@@ -430,17 +451,17 @@ func TestTCPConnectionProtocol(t *testing.T) {
 
 	_, port, _ := net.SplitHostPort(ln.Addr().String())
 
-	// Force IPv4
+	// Prefer IPv4
 	module := config.Module{
 		TCP: config.TCPProbe{
-			PreferredIPProtocol: "ip4",
+			IPProtocol: "ip4",
 		},
 	}
 
 	registry := prometheus.NewRegistry()
 	result := ProbeTCP(testCTX, net.JoinHostPort("localhost", port), module, registry, log.NewNopLogger())
 	if !result {
-		t.Fatalf("TCP protocol: \"tcp4\" connection test failed, expected success.")
+		t.Fatalf("TCP protocol: \"tcp\", prefer: \"ip4\" connection test failed, expected success.")
 	}
 	mfs, err := registry.Gather()
 	if err != nil {
@@ -451,50 +472,10 @@ func TestTCPConnectionProtocol(t *testing.T) {
 	}
 	checkRegistryResults(expectedResults, mfs, t)
 
-	// Force IPv6
-	module = config.Module{
-		TCP: config.TCPProbe{},
-	}
-
-	registry = prometheus.NewRegistry()
-	result = ProbeTCP(testCTX, net.JoinHostPort("localhost", port), module, registry, log.NewNopLogger())
-	if !result {
-		t.Fatalf("TCP protocol: \"tcp6\" connection test failed, expected success.")
-	}
-	mfs, err = registry.Gather()
-	if err != nil {
-		t.Fatal(err)
-	}
-	expectedResults = map[string]float64{
-		"probe_ip_protocol": 6,
-	}
-	checkRegistryResults(expectedResults, mfs, t)
-
-	// Prefer IPv4
-	module = config.Module{
-		TCP: config.TCPProbe{
-			PreferredIPProtocol: "ip4",
-		},
-	}
-
-	registry = prometheus.NewRegistry()
-	result = ProbeTCP(testCTX, net.JoinHostPort("localhost", port), module, registry, log.NewNopLogger())
-	if !result {
-		t.Fatalf("TCP protocol: \"tcp\", prefer: \"ip4\" connection test failed, expected success.")
-	}
-	mfs, err = registry.Gather()
-	if err != nil {
-		t.Fatal(err)
-	}
-	expectedResults = map[string]float64{
-		"probe_ip_protocol": 4,
-	}
-	checkRegistryResults(expectedResults, mfs, t)
-
 	// Prefer IPv6
 	module = config.Module{
 		TCP: config.TCPProbe{
-			PreferredIPProtocol: "ip6",
+			IPProtocol: "ip6",
 		},
 	}
 
@@ -530,25 +511,6 @@ func TestTCPConnectionProtocol(t *testing.T) {
 		"probe_ip_protocol": 6,
 	}
 	checkRegistryResults(expectedResults, mfs, t)
-
-	// No protocol
-	module = config.Module{
-		TCP: config.TCPProbe{},
-	}
-
-	registry = prometheus.NewRegistry()
-	result = ProbeTCP(testCTX, net.JoinHostPort("localhost", port), module, registry, log.NewNopLogger())
-	if !result {
-		t.Fatalf("TCP connection test with protocol unspecified failed, expected success.")
-	}
-	mfs, err = registry.Gather()
-	if err != nil {
-		t.Fatal(err)
-	}
-	expectedResults = map[string]float64{
-		"probe_ip_protocol": 6,
-	}
-	checkRegistryResults(expectedResults, mfs, t)
 }
 
 func TestPrometheusTimeoutTCP(t *testing.T) {
@@ -571,6 +533,7 @@ func TestPrometheusTimeoutTCP(t *testing.T) {
 	defer cancel()
 	registry := prometheus.NewRegistry()
 	if ProbeTCP(testCTX, ln.Addr().String(), config.Module{TCP: config.TCPProbe{
+		IPProtocolFallback: true,
 		QueryResponse: []config.QueryResponse{
 			{
 				Expect: "SSH-2.0-(OpenSSH_6.9p1) Debian-2",

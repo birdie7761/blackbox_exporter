@@ -1,6 +1,20 @@
+// Copyright 2016 The Prometheus Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package prober
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -9,9 +23,13 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"os"
 	"testing"
 	"time"
 
+	"github.com/go-kit/kit/log"
+
+	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 )
 
@@ -32,6 +50,35 @@ func checkRegistryResults(expRes map[string]float64, mfs []*dto.MetricFamily, t 
 	}
 }
 
+// Check if expected labels are in the registry
+func checkRegistryLabels(expRes map[string]map[string]string, mfs []*dto.MetricFamily, t *testing.T) {
+	results := make(map[string]map[string]string)
+	for _, mf := range mfs {
+		result := make(map[string]string)
+		for _, metric := range mf.Metric {
+			for _, l := range metric.GetLabel() {
+				result[l.GetName()] = l.GetValue()
+			}
+		}
+		results[mf.GetName()] = result
+	}
+
+	for metric, labelValues := range expRes {
+		if _, ok := results[metric]; !ok {
+			t.Fatalf("Expected metric %v not found in returned metrics", metric)
+		}
+		for name, exp := range labelValues {
+			val, ok := results[metric][name]
+			if !ok {
+				t.Fatalf("Expected label %v for metric %v not found in returned metrics", val, name)
+			}
+			if val != exp {
+				t.Fatalf("Expected: %v{%q=%q}, got: %v{%q=%q}", metric, name, exp, metric, name, val)
+			}
+		}
+	}
+}
+
 // Create test certificate with specified expiry date
 // Certificate will be self-signed and use localhost/127.0.0.1
 // Generated certificate and key are returned in PEM encoding
@@ -43,7 +90,7 @@ func generateTestCertificate(expiry time.Time, IPAddressSAN bool) ([]byte, []byt
 	publickey := &privatekey.PublicKey
 
 	cert := x509.Certificate{
-		IsCA: true,
+		IsCA:                  true,
 		BasicConstraintsValid: true,
 		SubjectKeyId:          []byte{1},
 		SerialNumber:          big.NewInt(1),
@@ -67,4 +114,31 @@ func generateTestCertificate(expiry time.Time, IPAddressSAN bool) ([]byte, []byt
 	pemCert := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: derCert})
 	pemKey := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privatekey)})
 	return pemCert, pemKey
+}
+
+func TestChooseProtocol(t *testing.T) {
+	ctx := context.Background()
+	registry := prometheus.NewPedanticRegistry()
+	w := log.NewSyncWriter(os.Stderr)
+	logger := log.NewLogfmtLogger(w)
+
+	ip, _, err := chooseProtocol(ctx, "ip4", true, "ipv6.google.com", registry, logger)
+	if err != nil {
+		t.Error(err)
+	}
+	if ip == nil || ip.IP.To4() != nil {
+		t.Error("with fallback it should answer")
+	}
+
+	registry = prometheus.NewPedanticRegistry()
+
+	ip, _, err = chooseProtocol(ctx, "ip4", false, "ipv6.google.com", registry, logger)
+	if err != nil && err.Error() != "unable to find ip; no fallback" {
+		t.Error(err)
+	} else if err == nil {
+		t.Error("should set error")
+	}
+	if ip != nil {
+		t.Error("without fallback it should not answer")
+	}
 }

@@ -1,3 +1,16 @@
+// Copyright 2016 The Prometheus Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package main
 
 import (
@@ -87,5 +100,93 @@ func TestDebugOutputSecretsHidden(t *testing.T) {
 	}
 	if !strings.Contains(out, "<secret>") {
 		t.Errorf("Hidden secret missing from debug output: %v", out)
+	}
+}
+
+func TestTimeoutIsSetCorrectly(t *testing.T) {
+	var tests = []struct {
+		inModuleTimeout     time.Duration
+		inPrometheusTimeout string
+		inOffset            float64
+		outTimeout          float64
+	}{
+		{0 * time.Second, "15", 0.5, 14.5},
+		{0 * time.Second, "15", 0, 15},
+		{20 * time.Second, "15", 0.5, 14.5},
+		{20 * time.Second, "15", 0, 15},
+		{5 * time.Second, "15", 0, 5},
+		{5 * time.Second, "15", 0.5, 5},
+		{10 * time.Second, "", 0.5, 10},
+		{10 * time.Second, "10", 0.5, 9.5},
+		{9500 * time.Millisecond, "", 0.5, 9.5},
+		{9500 * time.Millisecond, "", 1, 9.5},
+		{0 * time.Second, "", 0.5, 119.5},
+		{0 * time.Second, "", 0, 120},
+	}
+
+	for _, v := range tests {
+		request, _ := http.NewRequest("GET", "", nil)
+		request.Header.Set("X-Prometheus-Scrape-Timeout-Seconds", v.inPrometheusTimeout)
+		module := config.Module{
+			Timeout: v.inModuleTimeout,
+		}
+
+		timeout, _ := getTimeout(request, module, v.inOffset)
+		if timeout != v.outTimeout {
+			t.Errorf("timeout is incorrect: %v, want %v", timeout, v.outTimeout)
+		}
+	}
+}
+
+func TestComputeExternalURL(t *testing.T) {
+	tests := []struct {
+		input string
+		valid bool
+	}{
+		{
+			input: "",
+			valid: true,
+		},
+		{
+			input: "http://proxy.com/prometheus",
+			valid: true,
+		},
+		{
+			input: "'https://url/prometheus'",
+			valid: false,
+		},
+		{
+			input: "'relative/path/with/quotes'",
+			valid: false,
+		},
+		{
+			input: "http://alertmanager.company.com",
+			valid: true,
+		},
+		{
+			input: "https://double--dash.de",
+			valid: true,
+		},
+		{
+			input: "'http://starts/with/quote",
+			valid: false,
+		},
+		{
+			input: "ends/with/quote\"",
+			valid: false,
+		},
+	}
+
+	for _, test := range tests {
+		_, err := computeExternalURL(test.input, "0.0.0.0:9090")
+		if test.valid {
+			if err != nil {
+				t.Errorf("unexpected error %v", err)
+			}
+		} else {
+			if err == nil {
+				t.Errorf("expected error computing %s got none", test.input)
+			}
+		}
 	}
 }
