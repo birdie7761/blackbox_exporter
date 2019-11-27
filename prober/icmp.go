@@ -16,6 +16,7 @@ package prober
 import (
 	"bytes"
 	"context"
+	"math/rand"
 	"net"
 	"os"
 	"sync"
@@ -32,9 +33,26 @@ import (
 )
 
 var (
+	icmpID            int
 	icmpSequence      uint16
 	icmpSequenceMutex sync.Mutex
 )
+
+func init() {
+	// PID is typically 1 when running in a container; in that case, set
+	// the ICMP echo ID to a random value to avoid potential clashes with
+	// other blackbox_exporter instances. See #411.
+	if pid := os.Getpid(); pid == 1 {
+		icmpID = rand.Intn(1 << 16)
+	} else {
+		icmpID = pid & 0xffff
+	}
+
+	// Start the ICMP echo sequence at a random offset to prevent them from
+	// being in sync when several blackbox_exporter instances are restarted
+	// at the same time. See #411.
+	icmpSequence = uint16(rand.Intn(1 << 16))
+}
 
 func getICMPSequence() uint16 {
 	icmpSequenceMutex.Lock()
@@ -46,18 +64,27 @@ func getICMPSequence() uint16 {
 func ProbeICMP(ctx context.Context, target string, module config.Module, registry *prometheus.Registry, logger log.Logger) (success bool) {
 	var (
 		socket      net.PacketConn
-		socket6     *ipv6.PacketConn
 		requestType icmp.Type
 		replyType   icmp.Type
-	)
-	timeoutDeadline, _ := ctx.Deadline()
-	deadline := time.Now().Add(timeoutDeadline.Sub(time.Now()))
 
-	ip, _, err := chooseProtocol(module.ICMP.PreferredIPProtocol, target, registry, logger)
+		durationGaugeVec = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "probe_icmp_duration_seconds",
+			Help: "Duration of icmp request by phase",
+		}, []string{"phase"})
+	)
+
+	for _, lv := range []string{"resolve", "setup", "rtt"} {
+		durationGaugeVec.WithLabelValues(lv)
+	}
+
+	registry.MustRegister(durationGaugeVec)
+
+	ip, lookupTime, err := chooseProtocol(ctx, module.ICMP.IPProtocol, module.ICMP.IPProtocolFallback, target, registry, logger)
 	if err != nil {
 		level.Warn(logger).Log("msg", "Error resolving address", "err", err)
 		return false
 	}
+	durationGaugeVec.WithLabelValues("resolve").Add(lookupTime)
 
 	var srcIP net.IP
 	if len(module.ICMP.SourceIPAddress) > 0 {
@@ -68,35 +95,45 @@ func ProbeICMP(ctx context.Context, target string, module config.Module, registr
 		level.Info(logger).Log("msg", "Using source address", "srcIP", srcIP)
 	}
 
+	setupStart := time.Now()
 	level.Info(logger).Log("msg", "Creating socket")
 	if ip.IP.To4() == nil {
 		requestType = ipv6.ICMPTypeEchoRequest
 		replyType = ipv6.ICMPTypeEchoReply
 
-		icmpConn, err := icmp.ListenPacket("ip6:ipv6-icmp", "::")
+		if srcIP == nil {
+			srcIP = net.ParseIP("::")
+		}
+		icmpConn, err := icmp.ListenPacket("ip6:ipv6-icmp", srcIP.String())
 		if err != nil {
 			level.Error(logger).Log("msg", "Error listening to socket", "err", err)
 			return
 		}
 
 		socket = icmpConn
-		socket6 = icmpConn.IPv6PacketConn()
 	} else {
 		requestType = ipv4.ICMPTypeEcho
 		replyType = ipv4.ICMPTypeEchoReply
 
-		s, err := net.ListenPacket("ip4:icmp", "0.0.0.0")
+		if srcIP == nil {
+			srcIP = net.ParseIP("0.0.0.0")
+		}
+		icmpConn, err := net.ListenPacket("ip4:icmp", srcIP.String())
 		if err != nil {
 			level.Error(logger).Log("msg", "Error listening to socket", "err", err)
 			return
 		}
 
-		rc, err := ipv4.NewRawConn(s)
-		if err != nil {
-			level.Error(logger).Log("msg", "Error creating raw connection", "err", err)
-			return
+		if module.ICMP.DontFragment {
+			rc, err := ipv4.NewRawConn(icmpConn)
+			if err != nil {
+				level.Error(logger).Log("msg", "Error creating raw connection", "err", err)
+				return
+			}
+			socket = &v4Conn{c: rc, df: true}
+		} else {
+			socket = icmpConn
 		}
-		socket = &v4Conn{c: rc, df: module.ICMP.DontFragment, src: srcIP}
 	}
 
 	defer socket.Close()
@@ -110,7 +147,7 @@ func ProbeICMP(ctx context.Context, target string, module config.Module, registr
 	}
 
 	body := &icmp.Echo{
-		ID:   os.Getpid() & 0xffff,
+		ID:   icmpID,
 		Seq:  int(getICMPSequence()),
 		Data: data,
 	}
@@ -126,19 +163,12 @@ func ProbeICMP(ctx context.Context, target string, module config.Module, registr
 		level.Error(logger).Log("msg", "Error marshalling packet", "err", err)
 		return
 	}
+	durationGaugeVec.WithLabelValues("setup").Add(time.Since(setupStart).Seconds())
 	level.Info(logger).Log("msg", "Writing out packet")
-	if socket6 != nil && srcIP != nil {
-		// Also set source address for IPv6.
-		cm := &ipv6.ControlMessage{Src: srcIP}
-		if _, err = socket6.WriteTo(wb, cm, ip); err != nil {
-			level.Error(logger).Log("msg", "Error writing to IPv6 socket", "err", err)
-			return
-		}
-	} else {
-		if _, err = socket.WriteTo(wb, ip); err != nil {
-			level.Warn(logger).Log("msg", "Error writing to socket", "err", err)
-			return
-		}
+	rttStart := time.Now()
+	if _, err = socket.WriteTo(wb, ip); err != nil {
+		level.Warn(logger).Log("msg", "Error writing to socket", "err", err)
+		return
 	}
 
 	// Reply should be the same except for the message type.
@@ -150,6 +180,7 @@ func ProbeICMP(ctx context.Context, target string, module config.Module, registr
 	}
 
 	rb := make([]byte, 65536)
+	deadline, _ := ctx.Deadline()
 	if err := socket.SetReadDeadline(deadline); err != nil {
 		level.Error(logger).Log("msg", "Error setting socket deadline", "err", err)
 		return
@@ -173,7 +204,8 @@ func ProbeICMP(ctx context.Context, target string, module config.Module, registr
 			rb[2] = 0
 			rb[3] = 0
 		}
-		if bytes.Compare(rb[:n], wb) == 0 {
+		if bytes.Equal(rb[:n], wb) {
+			durationGaugeVec.WithLabelValues("rtt").Add(time.Since(rttStart).Seconds())
 			level.Info(logger).Log("msg", "Found matching reply packet")
 			return true
 		}

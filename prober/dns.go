@@ -29,10 +29,16 @@ import (
 
 // validRRs checks a slice of RRs received from the server against a DNSRRValidator.
 func validRRs(rrs *[]dns.RR, v *config.DNSRRValidator, logger log.Logger) bool {
+	var anyMatch bool = false
+	var allMatch bool = true
 	// Fail the probe if there are no RRs of a given type, but a regexp match is required
-	// (i.e. FailIfNotMatchesRegexp is set).
+	// (i.e. FailIfNotMatchesRegexp or FailIfNoneMatchesRegexp is set).
 	if len(*rrs) == 0 && len(v.FailIfNotMatchesRegexp) > 0 {
 		level.Error(logger).Log("msg", "fail_if_not_matches_regexp specified but no RRs returned")
+		return false
+	}
+	if len(*rrs) == 0 && len(v.FailIfNoneMatchesRegexp) > 0 {
+		level.Error(logger).Log("msg", "fail_if_none_matches_regexp specified but no RRs returned")
 		return false
 	}
 	for _, rr := range *rrs {
@@ -44,8 +50,18 @@ func validRRs(rrs *[]dns.RR, v *config.DNSRRValidator, logger log.Logger) bool {
 				return false
 			}
 			if match {
-				level.Error(logger).Log("msg", "RR matched regexp", "regexp", re, "rr", rr)
+				level.Error(logger).Log("msg", "At least one RR matched regexp", "regexp", re, "rr", rr)
 				return false
+			}
+		}
+		for _, re := range v.FailIfAllMatchRegexp {
+			match, err := regexp.MatchString(re, rr.String())
+			if err != nil {
+				level.Error(logger).Log("msg", "Error matching regexp", "regexp", re, "err", err)
+				return false
+			}
+			if !match {
+				allMatch = false
 			}
 		}
 		for _, re := range v.FailIfNotMatchesRegexp {
@@ -55,10 +71,28 @@ func validRRs(rrs *[]dns.RR, v *config.DNSRRValidator, logger log.Logger) bool {
 				return false
 			}
 			if !match {
-				level.Error(logger).Log("msg", "RR did not match regexp", "regexp", re, "rr", rr)
+				level.Error(logger).Log("msg", "At least one RR did not match regexp", "regexp", re, "rr", rr)
 				return false
 			}
 		}
+		for _, re := range v.FailIfNoneMatchesRegexp {
+			match, err := regexp.MatchString(re, rr.String())
+			if err != nil {
+				level.Error(logger).Log("msg", "Error matching regexp", "regexp", re, "err", err)
+				return false
+			}
+			if match {
+				anyMatch = true
+			}
+		}
+	}
+	if len(v.FailIfAllMatchRegexp) > 0 && !allMatch {
+		level.Error(logger).Log("msg", "Not all RRs matched regexp")
+		return false
+	}
+	if len(v.FailIfNoneMatchesRegexp) > 0 && !anyMatch {
+		level.Error(logger).Log("msg", "None of the RRs did matched any regexp")
+		return false
 	}
 	return true
 }
@@ -107,6 +141,17 @@ func ProbeDNS(ctx context.Context, target string, module config.Module, registry
 	registry.MustRegister(probeDNSAuthorityRRSGauge)
 	registry.MustRegister(probeDNSAdditionalRRSGauge)
 
+	qt := dns.TypeANY
+	if module.DNS.QueryType != "" {
+		var ok bool
+		qt, ok = dns.StringToType[module.DNS.QueryType]
+		if !ok {
+			level.Error(logger).Log("msg", "Invalid query type", "Type seen", module.DNS.QueryType, "Existing types", dns.TypeToString)
+			return false
+		}
+	}
+	var probeDNSSOAGauge prometheus.Gauge
+
 	var ip *net.IPAddr
 	if module.DNS.TransportProtocol == "" {
 		module.DNS.TransportProtocol = "udp"
@@ -118,7 +163,7 @@ func ProbeDNS(ctx context.Context, target string, module config.Module, registry
 			port = "53"
 			targetAddr = target
 		}
-		ip, _, err = chooseProtocol(module.DNS.PreferredIPProtocol, targetAddr, registry, logger)
+		ip, _, err = chooseProtocol(ctx, module.DNS.IPProtocol, module.DNS.IPProtocolFallback, targetAddr, registry, logger)
 		if err != nil {
 			level.Error(logger).Log("msg", "Error resolving address", "err", err)
 			return false
@@ -154,21 +199,12 @@ func ProbeDNS(ctx context.Context, target string, module config.Module, registry
 		}
 	}
 
-	qt := dns.TypeANY
-	if module.DNS.QueryType != "" {
-		var ok bool
-		qt, ok = dns.StringToType[module.DNS.QueryType]
-		if !ok {
-			level.Error(logger).Log("msg", "Invalid query type", "Type seen", module.DNS.QueryType, "Existing types", dns.TypeToString)
-			return false
-		}
-	}
 	msg := new(dns.Msg)
 	msg.SetQuestion(dns.Fqdn(module.DNS.QueryName), qt)
 
 	level.Info(logger).Log("msg", "Making DNS query", "target", target, "dial_protocol", dialProtocol, "query", module.DNS.QueryName, "type", qt)
 	timeoutDeadline, _ := ctx.Deadline()
-	client.Timeout = timeoutDeadline.Sub(time.Now())
+	client.Timeout = time.Until(timeoutDeadline)
 	response, _, err := client.Exchange(msg, target)
 	if err != nil {
 		level.Error(logger).Log("msg", "Error while sending a DNS query", "err", err)
@@ -179,6 +215,20 @@ func ProbeDNS(ctx context.Context, target string, module config.Module, registry
 	probeDNSAnswerRRSGauge.Set(float64(len(response.Answer)))
 	probeDNSAuthorityRRSGauge.Set(float64(len(response.Ns)))
 	probeDNSAdditionalRRSGauge.Set(float64(len(response.Extra)))
+
+	if qt == dns.TypeSOA {
+		probeDNSSOAGauge = prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "probe_dns_serial",
+			Help: "Returns the serial number of the zone",
+		})
+		registry.MustRegister(probeDNSSOAGauge)
+
+		for _, a := range response.Answer {
+			if soa, ok := a.(*dns.SOA); ok {
+				probeDNSSOAGauge.Set(float64(soa.Serial))
+			}
+		}
+	}
 
 	if !validRcode(response.Rcode, module.DNS.ValidRcodes, logger) {
 		return false

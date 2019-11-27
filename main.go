@@ -18,16 +18,21 @@ import (
 	"context"
 	"fmt"
 	"html"
+	"net"
 	"net/http"
 	_ "net/http/pprof"
+	"net/url"
 	"os"
 	"os/signal"
+	"path"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
+	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/expfmt"
@@ -35,7 +40,7 @@ import (
 	"github.com/prometheus/common/promlog/flag"
 	"github.com/prometheus/common/version"
 	"gopkg.in/alecthomas/kingpin.v2"
-	"gopkg.in/yaml.v2"
+	"gopkg.in/yaml.v3"
 
 	"github.com/prometheus/blackbox_exporter/config"
 	"github.com/prometheus/blackbox_exporter/prober"
@@ -49,6 +54,10 @@ var (
 	configFile    = kingpin.Flag("config.file", "Blackbox exporter configuration file.").Default("blackbox.yml").String()
 	listenAddress = kingpin.Flag("web.listen-address", "The address to listen on for HTTP requests.").Default(":9115").String()
 	timeoutOffset = kingpin.Flag("timeout-offset", "Offset to subtract from timeout in seconds.").Default("0.5").Float64()
+	configCheck   = kingpin.Flag("config.check", "If true validate the config file and then exit.").Default().Bool()
+	historyLimit  = kingpin.Flag("history.limit", "The maximum amount of items to keep in the history.").Default("100").Uint()
+	externalURL   = kingpin.Flag("web.external-url", "The URL under which Blackbox exporter is externally reachable (for example, if Blackbox exporter is served via a reverse proxy). Used for generating relative and absolute links back to Blackbox exporter itself. If the URL has a path portion, it will be used to prefix all HTTP endpoints served by Blackbox exporter. If omitted, relevant URL components will be derived automatically.").PlaceHolder("<url>").String()
+	routePrefix   = kingpin.Flag("web.route-prefix", "Prefix for the internal routes of web endpoints. Defaults to path of --web.external-url.").PlaceHolder("<path>").String()
 
 	Probers = map[string]prober.ProbeFn{
 		"http": prober.ProbeHTTP,
@@ -69,25 +78,13 @@ func probeHandler(w http.ResponseWriter, r *http.Request, c *config.Config, logg
 		return
 	}
 
-	// If a timeout is configured via the Prometheus header, add it to the request.
-	var timeoutSeconds float64
-	if v := r.Header.Get("X-Prometheus-Scrape-Timeout-Seconds"); v != "" {
-		var err error
-		timeoutSeconds, err = strconv.ParseFloat(v, 64)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("Failed to parse timeout from Prometheus header: %s", err), http.StatusInternalServerError)
-			return
-		}
-	}
-	if timeoutSeconds == 0 {
-		timeoutSeconds = 10
+	timeoutSeconds, err := getTimeout(r, module, *timeoutOffset)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to parse timeout from Prometheus header: %s", err), http.StatusInternalServerError)
+		return
 	}
 
-	if module.Timeout.Seconds() < timeoutSeconds && module.Timeout.Seconds() > 0 {
-		timeoutSeconds = module.Timeout.Seconds()
-	}
-	timeoutSeconds -= *timeoutOffset
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSeconds*float64(time.Second)))
+	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(timeoutSeconds*float64(time.Second)))
 	defer cancel()
 	r = r.WithContext(ctx)
 
@@ -144,8 +141,6 @@ func probeHandler(w http.ResponseWriter, r *http.Request, c *config.Config, logg
 
 type scrapeLogger struct {
 	next         log.Logger
-	module       string
-	target       string
 	buffer       bytes.Buffer
 	bufferLogger log.Logger
 }
@@ -174,7 +169,7 @@ func (sl scrapeLogger) Log(keyvals ...interface{}) error {
 	return sl.next.Log(kvs...)
 }
 
-// Returns plaintext debug output for a probe.
+// DebugOutput returns plaintext debug output for a probe.
 func DebugOutput(module *config.Module, logBuffer *bytes.Buffer, registry *prometheus.Registry) string {
 	buf := &bytes.Buffer{}
 	fmt.Fprintf(buf, "Logs for the probe:\n")
@@ -202,24 +197,56 @@ func init() {
 }
 
 func main() {
-	allowedLevel := promlog.AllowedLevel{}
-	flag.AddFlags(kingpin.CommandLine, &allowedLevel)
+	os.Exit(run())
+}
+
+func run() int {
+	promlogConfig := &promlog.Config{}
+	flag.AddFlags(kingpin.CommandLine, promlogConfig)
 	kingpin.Version(version.Print("blackbox_exporter"))
 	kingpin.HelpFlag.Short('h')
 	kingpin.Parse()
-	logger := promlog.New(allowedLevel)
-	rh := &resultHistory{}
+	logger := promlog.New(promlogConfig)
+	rh := &resultHistory{maxResults: *historyLimit}
 
 	level.Info(logger).Log("msg", "Starting blackbox_exporter", "version", version.Info())
 	level.Info(logger).Log("msg", "Build context", version.BuildContext())
 
 	if err := sc.ReloadConfig(*configFile); err != nil {
 		level.Error(logger).Log("msg", "Error loading config", "err", err)
-		os.Exit(1)
+		return 1
 	}
+
+	if *configCheck {
+		level.Info(logger).Log("msg", "Config file is ok exiting...")
+		return 0
+	}
+
 	level.Info(logger).Log("msg", "Loaded config file")
 
-	hup := make(chan os.Signal)
+	// Infer or set Blackbox exporter externalURL
+	beURL, err := computeExternalURL(*externalURL, *listenAddress)
+	if err != nil {
+		level.Error(logger).Log("msg", "failed to determine external URL", "err", err)
+		return 1
+	}
+	level.Debug(logger).Log("externalURL", beURL.String())
+
+	// Default -web.route-prefix to path of -web.external-url.
+	if *routePrefix == "" {
+		*routePrefix = beURL.Path
+	}
+
+	// routePrefix must always be at least '/'.
+	*routePrefix = "/" + strings.Trim(*routePrefix, "/")
+	// routePrefix requires path to have trailing "/" in order
+	// for browsers to interpret the path-relative path correctly, instead of stripping it.
+	if *routePrefix != "/" {
+		*routePrefix = *routePrefix + "/"
+	}
+	level.Debug(logger).Log("routePrefix", *routePrefix)
+
+	hup := make(chan os.Signal, 1)
 	reloadCh := make(chan chan error)
 	signal.Notify(hup, syscall.SIGHUP)
 	go func() {
@@ -243,7 +270,19 @@ func main() {
 		}
 	}()
 
-	http.HandleFunc("/-/reload",
+	// Match Prometheus behaviour and redirect over externalURL for root path only
+	// if routePrefix is different than "/"
+	if *routePrefix != "/" {
+		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/" {
+				http.NotFound(w, r)
+				return
+			}
+			http.Redirect(w, r, beURL.String(), http.StatusFound)
+		})
+	}
+
+	http.HandleFunc(path.Join(*routePrefix, "/-/reload"),
 		func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != "POST" {
 				w.WriteHeader(http.StatusMethodNotAllowed)
@@ -257,23 +296,23 @@ func main() {
 				http.Error(w, fmt.Sprintf("failed to reload config: %s", err), http.StatusInternalServerError)
 			}
 		})
-	http.Handle("/metrics", promhttp.Handler())
-	http.HandleFunc("/probe", func(w http.ResponseWriter, r *http.Request) {
+	http.Handle(path.Join(*routePrefix, "/metrics"), promhttp.Handler())
+	http.HandleFunc(path.Join(*routePrefix, "/probe"), func(w http.ResponseWriter, r *http.Request) {
 		sc.Lock()
 		conf := sc.C
 		sc.Unlock()
 		probeHandler(w, r, conf, logger, rh)
 	})
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc(*routePrefix, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
 		w.Write([]byte(`<html>
     <head><title>Blackbox Exporter</title></head>
     <body>
     <h1>Blackbox Exporter</h1>
-    <p><a href="/probe?target=prometheus.io&module=http_2xx">Probe prometheus.io for http_2xx</a></p>
-    <p><a href="/probe?target=prometheus.io&module=http_2xx&debug=true">Debug probe prometheus.io for http_2xx</a></p>
-    <p><a href="/metrics">Metrics</a></p>
-    <p><a href="/config">Configuration</a></p>
+    <p><a href="probe?target=prometheus.io&module=http_2xx">Probe prometheus.io for http_2xx</a></p>
+    <p><a href="probe?target=prometheus.io&module=http_2xx&debug=true">Debug probe prometheus.io for http_2xx</a></p>
+    <p><a href="metrics">Metrics</a></p>
+    <p><a href="config">Configuration</a></p>
     <h2>Recent Probes</h2>
     <table border='1'><tr><th>Module</th><th>Target</th><th>Result</th><th>Debug</th>`))
 
@@ -293,7 +332,7 @@ func main() {
     </html>`))
 	})
 
-	http.HandleFunc("/logs", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc(path.Join(*routePrefix, "/logs"), func(w http.ResponseWriter, r *http.Request) {
 		id, err := strconv.ParseInt(r.URL.Query().Get("id"), 10, 64)
 		if err != nil {
 			http.Error(w, "Invalid probe id", 500)
@@ -308,7 +347,7 @@ func main() {
 		w.Write([]byte(result.debugOutput))
 	})
 
-	http.HandleFunc("/config", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc(path.Join(*routePrefix, "/config"), func(w http.ResponseWriter, r *http.Request) {
 		sc.RLock()
 		c, err := yaml.Marshal(sc.C)
 		sc.RUnlock()
@@ -321,9 +360,88 @@ func main() {
 		w.Write(c)
 	})
 
-	level.Info(logger).Log("msg", "Listening on address", "address", *listenAddress)
-	if err := http.ListenAndServe(*listenAddress, nil); err != nil {
-		level.Error(logger).Log("msg", "Error starting HTTP server", "err", err)
-		os.Exit(1)
+	srv := http.Server{Addr: *listenAddress}
+	srvc := make(chan struct{})
+	term := make(chan os.Signal, 1)
+	signal.Notify(term, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		level.Info(logger).Log("msg", "Listening on address", "address", *listenAddress)
+		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+			level.Error(logger).Log("msg", "Error starting HTTP server", "err", err)
+			close(srvc)
+		}
+	}()
+
+	for {
+		select {
+		case <-term:
+			level.Info(logger).Log("msg", "Received SIGTERM, exiting gracefully...")
+			return 0
+		case <-srvc:
+			return 1
+		}
 	}
+
+}
+
+func getTimeout(r *http.Request, module config.Module, offset float64) (timeoutSeconds float64, err error) {
+	// If a timeout is configured via the Prometheus header, add it to the request.
+	if v := r.Header.Get("X-Prometheus-Scrape-Timeout-Seconds"); v != "" {
+		var err error
+		timeoutSeconds, err = strconv.ParseFloat(v, 64)
+		if err != nil {
+			return 0, err
+		}
+	}
+	if timeoutSeconds == 0 {
+		timeoutSeconds = 120
+	}
+
+	var maxTimeoutSeconds = timeoutSeconds - offset
+	if module.Timeout.Seconds() < maxTimeoutSeconds && module.Timeout.Seconds() > 0 {
+		timeoutSeconds = module.Timeout.Seconds()
+	} else {
+		timeoutSeconds = maxTimeoutSeconds
+	}
+
+	return timeoutSeconds, nil
+}
+
+func startsOrEndsWithQuote(s string) bool {
+	return strings.HasPrefix(s, "\"") || strings.HasPrefix(s, "'") ||
+		strings.HasSuffix(s, "\"") || strings.HasSuffix(s, "'")
+}
+
+// computeExternalURL computes a sanitized external URL from a raw input. It infers unset
+// URL parts from the OS and the given listen address.
+func computeExternalURL(u, listenAddr string) (*url.URL, error) {
+	if u == "" {
+		hostname, err := os.Hostname()
+		if err != nil {
+			return nil, err
+		}
+		_, port, err := net.SplitHostPort(listenAddr)
+		if err != nil {
+			return nil, err
+		}
+		u = fmt.Sprintf("http://%s:%s/", hostname, port)
+	}
+
+	if startsOrEndsWithQuote(u) {
+		return nil, errors.New("URL must not begin or end with quotes")
+	}
+
+	eu, err := url.Parse(u)
+	if err != nil {
+		return nil, err
+	}
+
+	ppref := strings.TrimRight(eu.Path, "/")
+	if ppref != "" && !strings.HasPrefix(ppref, "/") {
+		ppref = "/" + ppref
+	}
+	eu.Path = ppref
+
+	return eu, nil
 }
